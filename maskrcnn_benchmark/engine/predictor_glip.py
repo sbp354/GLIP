@@ -1,37 +1,39 @@
-import cv2
-import torch
 import re
-import numpy as np
 from typing import List, Union
-import nltk
-import inflect
-from transformers import AutoTokenizer
-from torchvision import transforms as T
 
-from maskrcnn_benchmark.modeling.detector import build_detection_model
-from maskrcnn_benchmark.utils.checkpoint import DetectronCheckpointer
-from maskrcnn_benchmark.structures.image_list import to_image_list
-from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
-from maskrcnn_benchmark.structures.bounding_box import BoxList
+import cv2
+import inflect
+import nltk
+import numpy as np
+import torch
+from torchvision import transforms as T
+from transformers import AutoTokenizer
+
 from maskrcnn_benchmark import layers as L
+from maskrcnn_benchmark.modeling.detector import build_detection_model
 from maskrcnn_benchmark.modeling.roi_heads.mask_head.inference import Masker
+from maskrcnn_benchmark.structures.bounding_box import BoxList
+from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
+from maskrcnn_benchmark.structures.image_list import to_image_list
 from maskrcnn_benchmark.utils import cv2_util
+from maskrcnn_benchmark.utils.checkpoint import DetectronCheckpointer
 
 engine = inflect.engine()
-nltk.download('punkt')
-nltk.download('averaged_perceptron_tagger')
+nltk.download("punkt")
+nltk.download("averaged_perceptron_tagger")
 
 import timeit
 
 
 class GLIPDemo(object):
-    def __init__(self,
-                 cfg,
-                 confidence_threshold=0.7,
-                 min_image_size=None,
-                 show_mask_heatmaps=False,
-                 masks_per_dim=5,
-                 ):
+    def __init__(
+        self,
+        cfg,
+        confidence_threshold=0.7,
+        min_image_size=None,
+        show_mask_heatmaps=False,
+        masks_per_dim=5,
+    ):
         self.cfg = cfg.clone()
         self.model = build_detection_model(cfg)
         self.model.eval()
@@ -50,7 +52,7 @@ class GLIPDemo(object):
         # used to make colors for each tokens
         mask_threshold = -1 if show_mask_heatmaps else 0.5
         self.masker = Masker(threshold=mask_threshold, padding=1)
-        self.palette = torch.tensor([2 ** 25 - 1, 2 ** 15 - 1, 2 ** 21 - 1])
+        self.palette = torch.tensor([2**25 - 1, 2**15 - 1, 2**21 - 1])
         self.cpu_device = torch.device("cpu")
         self.confidence_threshold = confidence_threshold
 
@@ -78,7 +80,9 @@ class GLIPDemo(object):
         transform = T.Compose(
             [
                 T.ToPILImage(),
-                T.Resize(self.min_image_size) if self.min_image_size is not None else lambda x: x,
+                T.Resize(self.min_image_size)
+                if self.min_image_size is not None
+                else lambda x: x,
                 T.ToTensor(),
                 to_bgr_transform,
                 normalize_transform,
@@ -93,18 +97,23 @@ class GLIPDemo(object):
             tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
         elif cfg.MODEL.LANGUAGE_BACKBONE.TOKENIZER_TYPE == "clip":
             from transformers import CLIPTokenizerFast
+
             if cfg.MODEL.DYHEAD.FUSE_CONFIG.MLM_LOSS:
-                tokenizer = CLIPTokenizerFast.from_pretrained("openai/clip-vit-base-patch32",
-                                                              from_slow=True, mask_token='ðŁĴĳ</w>')
+                tokenizer = CLIPTokenizerFast.from_pretrained(
+                    "openai/clip-vit-base-patch32",
+                    from_slow=True,
+                    mask_token="ðŁĴĳ</w>",
+                )
             else:
-                tokenizer = CLIPTokenizerFast.from_pretrained("openai/clip-vit-base-patch32",
-                                                              from_slow=True)
+                tokenizer = CLIPTokenizerFast.from_pretrained(
+                    "openai/clip-vit-base-patch32", from_slow=True
+                )
         return tokenizer
 
     def run_ner(self, caption):
         noun_phrases = find_noun_phrases(caption)
         noun_phrases = [remove_punctuation(phrase) for phrase in noun_phrases]
-        noun_phrases = [phrase for phrase in noun_phrases if phrase != '']
+        noun_phrases = [phrase for phrase in noun_phrases if phrase != ""]
         relevant_phrases = noun_phrases
         labels = noun_phrases
         self.entities = labels
@@ -128,11 +137,16 @@ class GLIPDemo(object):
         top_predictions = self._post_process_fixed_thresh(predictions)
         return top_predictions
 
-    def run_on_web_image(self, original_image, original_caption, thresh=0.5):
-        predictions = self.compute_prediction(original_image, original_caption)
+    def get_predictions(
+        self, original_image, original_caption, tokens_positive, thresh=0
+    ):
+        predictions = self.compute_prediction(
+            original_image, original_caption, tokens_positive
+        )
         top_predictions = self._post_process(predictions, thresh)
 
         result = original_image.copy()
+
         if self.show_mask_heatmaps:
             return self.create_mask_montage(result, top_predictions)
         result = self.overlay_boxes(result, top_predictions)
@@ -140,32 +154,42 @@ class GLIPDemo(object):
         if self.cfg.MODEL.MASK_ON:
             result = self.overlay_mask(result, top_predictions)
 
-        return result, top_predictions
+        return result, predictions, top_predictions
 
-    def compute_prediction(self, original_image, original_caption):
+    def compute_prediction(self, original_image, original_caption, tokens_positive):
         # image
         image = self.transforms(original_image)
         image_list = to_image_list(image, self.cfg.DATALOADER.SIZE_DIVISIBILITY)
         image_list = image_list.to(self.device)
         # caption
         tokenized = self.tokenizer([original_caption], return_tensors="pt")
-        tokens_positive = self.run_ner(original_caption)
+
         # process positive map
         positive_map = create_positive_map(tokenized, tokens_positive)
-
+        self.entities = [
+            original_caption[span[0][0] : span[0][1]] for span in tokens_positive
+        ]
         if self.cfg.MODEL.RPN_ARCHITECTURE == "VLDYHEAD":
             plus = 1
         else:
             plus = 0
 
-        positive_map_label_to_token = create_positive_map_label_to_token_from_positive_map(positive_map, plus=plus)
+        positive_map_label_to_token = (
+            create_positive_map_label_to_token_from_positive_map(
+                positive_map, plus=plus
+            )
+        )
         self.plus = plus
         self.positive_map_label_to_token = positive_map_label_to_token
         tic = timeit.time.perf_counter()
 
         # compute predictions
         with torch.no_grad():
-            predictions = self.model(image_list, captions=[original_caption], positive_map=positive_map_label_to_token)
+            predictions = self.model(
+                image_list,
+                captions=[original_caption],
+                positive_map=positive_map_label_to_token,
+            )
             predictions = [o.to(self.cpu_device) for o in predictions]
         print("inference time per image: {}".format(timeit.time.perf_counter() - tic))
 
@@ -240,7 +264,8 @@ class GLIPDemo(object):
             box = box.to(torch.int64)
             top_left, bottom_right = box[:2].tolist(), box[2:].tolist()
             image = cv2.rectangle(
-                image, tuple(top_left), tuple(bottom_right), tuple(color), 2)
+                image, tuple(top_left), tuple(bottom_right), tuple(color), 2
+            )
 
         return image
 
@@ -250,10 +275,15 @@ class GLIPDemo(object):
 
         for box, score in zip(boxes, scores):
             box = box.to(torch.int64)
-            image = cv2.putText(image, '%.3f' % score,
-                                (int(box[0]), int((box[1] + box[3]) / 2)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.3,
-                                (255, 255, 255), 1)
+            image = cv2.putText(
+                image,
+                "%.3f" % score,
+                (int(box[0]), int((box[1] + box[3]) / 2)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.3,
+                (255, 255, 255),
+                1,
+            )
 
         return image
 
@@ -266,10 +296,10 @@ class GLIPDemo(object):
                 if i <= len(self.entities):
                     new_labels.append(self.entities[i - self.plus])
                 else:
-                    new_labels.append('object')
+                    new_labels.append("object")
             # labels = [self.entities[i - self.plus] for i in labels ]
         else:
-            new_labels = ['object' for i in labels]
+            new_labels = ["object" for i in labels]
         boxes = predictions.bbox
 
         template = "{}: {:.2f}"
@@ -277,7 +307,13 @@ class GLIPDemo(object):
             x, y = box[:2]
             s = template.format(label, score)
             cv2.putText(
-                image, s, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 1
+                image,
+                s,
+                (int(x), int(y)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
             )
 
         return image
@@ -306,11 +342,9 @@ class GLIPDemo(object):
     def create_mask_montage(self, image, predictions):
         masks = predictions.get_field("mask")
         masks_per_dim = self.masks_per_dim
-        masks = L.interpolate(
-            masks.float(), scale_factor=1 / masks_per_dim
-        ).byte()
+        masks = L.interpolate(masks.float(), scale_factor=1 / masks_per_dim).byte()
         height, width = masks.shape[-2:]
-        max_masks = masks_per_dim ** 2
+        max_masks = masks_per_dim**2
         masks = masks[:max_masks]
         # handle case where we have less detections than max_masks
         if len(masks) < max_masks:
@@ -335,7 +369,9 @@ class GLIPDemo(object):
 def create_positive_map_label_to_token_from_positive_map(positive_map, plus=0):
     positive_map_label_to_token = {}
     for i in range(len(positive_map)):
-        positive_map_label_to_token[i + plus] = torch.nonzero(positive_map[i], as_tuple=True)[0].tolist()
+        positive_map_label_to_token[i + plus] = torch.nonzero(
+            positive_map[i], as_tuple=True
+        )[0].tolist()
     return positive_map_label_to_token
 
 
@@ -344,7 +380,7 @@ def create_positive_map(tokenized, tokens_positive):
     positive_map = torch.zeros((len(tokens_positive), 256), dtype=torch.float)
 
     for j, tok_list in enumerate(tokens_positive):
-        for (beg, end) in tok_list:
+        for beg, end in tok_list:
             try:
                 beg_pos = tokenized.char_to_token(beg)
                 end_pos = tokenized.char_to_token(end - 1)
@@ -371,7 +407,7 @@ def create_positive_map(tokenized, tokens_positive):
                 continue
 
             assert beg_pos is not None and end_pos is not None
-            positive_map[j, beg_pos: end_pos + 1].fill_(1)
+            positive_map[j, beg_pos : end_pos + 1].fill_(1)
     return positive_map / (positive_map.sum(-1)[:, None] + 1e-6)
 
 
@@ -386,16 +422,40 @@ def find_noun_phrases(caption: str) -> List[str]:
 
     noun_phrases = list()
     for subtree in result.subtrees():
-        if subtree.label() == 'NP':
-            noun_phrases.append(' '.join(t[0] for t in subtree.leaves()))
+        if subtree.label() == "NP":
+            noun_phrases.append(" ".join(t[0] for t in subtree.leaves()))
 
     return noun_phrases
 
 
 def remove_punctuation(text: str) -> str:
-    punct = ['|', ':', ';', '@', '(', ')', '[', ']', '{', '}', '^',
-             '\'', '\"', '’', '`', '?', '$', '%', '#', '!', '&', '*', '+', ',', '.'
-             ]
+    punct = [
+        "|",
+        ":",
+        ";",
+        "@",
+        "(",
+        ")",
+        "[",
+        "]",
+        "{",
+        "}",
+        "^",
+        "'",
+        '"',
+        "’",
+        "`",
+        "?",
+        "$",
+        "%",
+        "#",
+        "!",
+        "&",
+        "*",
+        "+",
+        ",",
+        ".",
+    ]
     for p in punct:
-        text = text.replace(p, '')
+        text = text.replace(p, "")
     return text.strip()
